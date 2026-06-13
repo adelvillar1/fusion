@@ -45,7 +45,7 @@ that uses Hermes's existing model slots to fan out locally.
 
 | File | Purpose |
 |------|---------|
-| `tools/fusion_tool.py` | Tool implementation + `registry.register()` |
+| `tools/fusion_tool.py` | Tool implementation + `registry.register()` (tool name: `fusion`) |
 | `tools/fusion/` | Package: backend-agnostic core |
 | `tools/fusion/__init__.py` | Re-exports |
 | `tools/fusion/analysis.py` | Shared `StructuredAnalysis` Pydantic model + judge prompt |
@@ -103,12 +103,13 @@ that uses Hermes's existing model slots to fan out locally.
 
 ## 3. Tool schema
 
-Tool name: `openrouter_fusion` (kept for v1 compat; renamed to `fusion`
-in v0.2). Toolset: `fusion_tools`.
+Tool name: **`fusion`** (renamed from v1's `openrouter_fusion` per Pass
+2 T1.2 — v0.1 hasn't shipped, no v1 to be compatible with, and the
+v2 plan's thesis is "OpenRouter is opt-in"). Toolset: `fusion_tools`.
 
 ```python
 {
-    "name": "openrouter_fusion",
+    "name": "fusion",
     "description": (
         "Run the user prompt through a panel of 2-8 models in parallel and "
         "have a judge model produce a structured analysis (consensus, "
@@ -261,27 +262,62 @@ class FusionBackend(ABC):
 
 ### 4.2 The runner (backend-agnostic orchestration)
 
+The **runner owns the judge.** Backends only do panel fan-out; the runner
+post-processes the panel response to produce the structured analysis.
+This is the single source of truth for "who runs the judge" and is
+consistent with the cost model in §6.1 (judge receives 18K+ input tokens
+concatenated from all panel responses).
+
 ```python
 # tools/fusion/runner.py
-class FusionRunner:
-    def __init__(self, backend: FusionBackend, judge_model: str, config: FusionConfig):
-        self.backend = backend
-        self.judge_model = judge_model
-        self.config = config
+from contextvars import ContextVar
 
-    async def run(self, prompt: str, panel_models: list[str], **kwargs) -> PanelResponse:
-        # 1. Recursion guard (ContextVar) — see §4.4
-        # 2. Cost guard — refuse if len(panel_models) > max_panel_size
-        # 3. Backend.run_panel(...) — backend does the parallel fan-out
-        # 4. If backend didn't produce analysis, run the judge separately
-        #    (hermes-native does this; openrouter-fusion does it server-side)
-        # 5. Return the structured response
+# Plugin-owned recursion guard (not in hermes-agent core).
+# A subagent implementing this MUST define its own ContextVar — do NOT
+# import one from run_agent.py (circular import; hermes-agent doesn't
+# know about the plugin).
+_fusion_depth: ContextVar[int] = ContextVar('fusion_depth', default=0)
+
+class FusionRunner:
+    def __init__(self, backend: FusionBackend, default_judge_model: str, config: FusionConfig):
+        self.backend = backend
+        self.default_judge_model = default_judge_model
+        self.config = config  # built once from config.yaml at tool registration
+
+    async def run(self, prompt: str, panel_models: list[str], **overrides) -> PanelResponse:
+        # 1. Recursion guard: ContextVar.set/reset around the whole call
+        token = _fusion_depth.set(_fusion_depth.get() + 1)
+        try:
+            # 2. Cost guard — refuse if len(panel_models) > max_panel_size
+            self._check_cost_guard(panel_models)
+
+            # 3. Backend fan-out (backend does NOT do the judge)
+            request = PanelRequest(prompt=prompt, analysis_models=panel_models, ...)
+            panel_response = await self.backend.run_panel(request, ...)
+
+            # 4. Runner invokes the judge (NOT the backend)
+            if panel_response.responses:
+                judge_model = self._resolve_judge_model(overrides)
+                analysis, raw = await self._invoke_judge(prompt, panel_response, judge_model)
+                panel_response.analysis = analysis
+                panel_response.raw_judge_output = raw
+
+            return panel_response
+        finally:
+            _fusion_depth.reset(token)
 ```
 
 The runner is the same regardless of backend. The backend decides how
-to fan out (local asyncio.gather vs. server-side OpenRouter call) and
-whether the judge runs inside the backend (OpenRouter) or is invoked
-separately by the runner (hermes-native).
+to fan out (local `asyncio.gather` vs. server-side OpenRouter call) and
+returns a `PanelResponse` with empty `analysis` and empty
+`raw_judge_output`. The runner fills those fields in.
+
+**Note on `max_tool_calls` for hermes-native v0.1:** this parameter is
+accepted in the schema and passed to the backend, but the hermes-native
+backend **ignores it** in v0.1 (panel members make single completion
+calls; no tool-calling loop). Only the openrouter-fusion backend
+currently uses it. v0.2 may add tool-use loops to hermes-native panel
+members.
 
 ### 4.3 The hermes-native backend
 
@@ -291,15 +327,42 @@ class HermesNativeBackend(FusionBackend):
     name = "hermes-native"
 
     def check_requirements(self) -> bool:
-        return True   # no external deps; uses existing model slots
+        """Hermes-native needs at least 2 models in the fallback chain.
+        If fewer are configured, the tool is not callable and check_requirements
+        returns False so the agent sees a clear 'fusion not available' status
+        instead of a confusing runtime error.
+        """
+        cfg = _load_hermes_config()
+        providers = cfg.get("model", {}).get("fallback_providers", [])
+        return len(providers) >= 2
 
     async def run_panel(self, request: PanelRequest, *, outer_model, judge_model) -> PanelResponse:
-        # Fan out via asyncio.gather over the user's existing model providers.
-        # Each panel member gets the prompt + outer model context; we call
-        # the provider directly using Hermes's existing client infrastructure
-        # (see auxiliary_client.py). The judge runs as one of the panel
-        # members — either the explicit judge_model or a designated slot.
-        # No new model-routing logic; this reuses model.fallback_providers.
+        # v0.1 semantics: per-member-fail, NOT per-member-substitute.
+        # If a panel member fails, it appears in `failed_models` and the
+        # panel continues with the remaining members. The user gets the
+        # panel they asked for, with explicit failure surfacing.
+        # Per-member-substitute is v0.2 (requires resolved_model tracking).
+        #
+        # CRITICAL: asyncio.gather(..., return_exceptions=True) is required
+        # so a single panel member's failure does NOT crash the whole call
+        # and lose the successful responses. The §4.6 partial-failure-paths
+        # contract depends on this.
+        tasks = [
+            _call_single_model(model, request)
+            for model in request.analysis_models
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        responses, failed_models = [], []
+        for model, result in zip(request.analysis_models, results):
+            if isinstance(result, Exception):
+                failed_models.append({
+                    "model": model,
+                    "reason": f"{type(result).__name__}: {result}",
+                })
+            else:
+                responses.append({"model": model, "content": result})
+        return PanelResponse(responses=responses, failed_models=failed_models)
 ```
 
 The hermes-native backend uses the **same model clients Hermes already
@@ -309,23 +372,33 @@ This means:
 
 - If the user has Anthropic + DeepSeek + Kimi keys, the panel can be
   Claude + DeepSeek + Kimi without any new credentials.
-- If a model in the panel fails, the `fallback_providers` chain activates
-  per-panel-member (existing Hermes behavior).
+- If a model in the panel fails (timeout, auth, rate limit), the
+  **per-member-fail** path puts it in `failed_models`; the other
+  members' responses are preserved.
 - The user pays their existing provider rates, not OpenRouter's
   aggregator markup.
-- The judge can be the `auxiliary.curator` slot (typically a strong
-  reasoner like Kimi K2.6) or the outer model.
+- The judge is invoked by the **runner** (see §4.2) after
+  `run_panel` returns, not by the backend.
 
-### 4.4 Recursion guard (ContextVar)
+### 4.4 Recursion guard (plugin-owned ContextVar)
 
-Same as v1 §4. A request-scoped `contextvars.ContextVar[int]` named
-`_fusion_depth` lives in `run_agent.py`. The runner increments on
-entry, resets in `finally`. Raises `RecursionError` if `>= 1`.
+The recursion guard is a **plugin-owned** `ContextVar` defined in
+`tools/fusion/runner.py`. The plugin MUST NOT import from
+`~/.hermes/hermes-agent/run_agent.py` — that would be a circular import
+(plugin → core → plugin) and is the wrong direction anyway. The
+ContextVar is set/reset by the runner (see §4.2 pseudocode). The
+upstream PR (v0.1.1) may add a shared registry in hermes-agent for
+plugins to publish ContextVars they need the agent loop to wrap, but
+that's not required for v0.1.
 
 Per-call scope: two independent fusion calls in the same conversation
-session both succeed.
+session both succeed (each call gets its own `set`/`reset` cycle).
 
 ### 4.5 The judge layer (shared between backends)
+
+The runner invokes the judge model (the backend does NOT run the judge).
+The judge receives the user's prompt plus all panel responses
+concatenated, and produces a `StructuredAnalysis` JSON.
 
 ```python
 # tools/fusion/analysis.py
@@ -352,6 +425,38 @@ class StructuredAnalysis(BaseModel):
     unique_insights: list[UniqueInsight]
     blind_spots: list[str]
 ```
+
+**Judge input assembly (runner-side):** the runner concatenates panel
+responses into a single user message:
+
+```
+You have been given the following {N} responses to the same prompt:
+
+[Response 1 from {model_1}]
+{content_1}
+
+[Response 2 from {model_2}]
+{content_2}
+
+...
+
+{JUDGE_PROMPT}
+```
+
+The 18K input token count in §6.1 assumes 3 panel members × 6K average
+response. The judge is invoked with `tool_choice: "required"` on the
+inner call (so the OpenRouter backend's structured-analysis path is
+also explicit), or via direct provider call for hermes-native.
+
+**`judge_strategy` resolution (runner-side):**
+1. `outer-model` (default, zero extra cost) — the same model that
+   invoked the fusion tool
+2. `auxiliary-curator` — the agent's configured curator slot (e.g.,
+   Kimi K2.6). **Fallback:** if the curator's provider is unavailable,
+   log a warning and fall back to `outer-model`. If the outer model is
+   also unavailable, skip the judge and return raw panel responses
+   (the outer model can synthesize from them).
+3. `explicit-model` — use `judge_model` from the tool args
 
 Both backends use this prompt and parse into `StructuredAnalysis`. The
 OpenRouter backend gets the structured analysis for free (the server
@@ -391,8 +496,12 @@ fusion:
   backend: "hermes-native"
 
   # Default panel. Override per-call via the tool's `analysis_models` param.
-  # Default: pull 2-3 models from model.fallback_providers if unset.
-  analysis_models: []   # empty = auto-populate from fallback chain
+  # Default: take the first 3 entries of model.fallback_providers.
+  # Auto-population rule: if `analysis_models` is empty, the runner reads
+  # model.fallback_providers and uses the first 3 entries (or all of them
+  # if fewer than 3). If the chain has <2 entries, check_requirements
+  # returns False and the tool is not callable (clear error to user).
+  analysis_models: []   # empty = auto-populate (first 3 of fallback chain)
 
   # Judge model selection.
   judge_strategy: "outer-model"   # outer-model | auxiliary-curator | explicit-model
@@ -504,12 +613,33 @@ before fan-out based on input-size × rate estimates.
   `OpenRouterFusionBackend` with a mocked `httpx.AsyncClient`.
 - **hermes-native backend tests** (`tests/test_fusion_hermes_native.py`):
   mocked `auxiliary_client` calls, verifying:
-  - `asyncio.gather` over panel members
-  - Per-panel-member fallback chain activation
-  - Judge invocation via `auxiliary.curator` slot
+  - `asyncio.gather(..., return_exceptions=True)` is used (a single
+    failure does NOT lose the other responses)
+  - Per-member-fail: a failed member appears in `failed_models`,
+    other members' responses are preserved
+  - Judge invocation via `auxiliary.curator` slot OR outer model
+    (depending on `judge_strategy`)
   - Timeout enforcement via `asyncio.wait_for`
+  - `check_requirements` returns False when fallback chain has <2
+    models (with a test that doesn't have fallback_providers set)
 - **Recorded-fixture tests** (`tests/test_fusion_tool_recorded.py`):
   replay sanitized `tests/fixtures/fusion-*.json` through the runner.
+  Fixture format matches the `PanelResponse` shape:
+  ```json
+  {
+    "backend": "hermes-native",
+    "panel_request": {
+      "prompt": "...",
+      "analysis_models": ["claude-...", "deepseek-..."]
+    },
+    "expected_panel_response": {
+      "responses": [{"model": "...", "content": "..."}, ...],
+      "failed_models": [],
+      "analysis": {"consensus": [...], "contradictions": [...], ...},
+      "raw_judge_output": null
+    }
+  }
+  ```
   Required fixtures:
   1. `success.json` — full success, both `analysis` and `responses` populated
   2. `judge-degraded.json` — panel succeeds, judge fails, no `analysis`
@@ -530,91 +660,106 @@ No live network calls in CI. Matches the Hermes skill standards.
 
 ### v0.1 (in this repo, shipped with the tool)
 
-1. **`run_agent.py` modification** (Hermes core): add
-   `from contextvars import ContextVar` and
-   `_fusion_depth: ContextVar[int] = ContextVar('fusion_depth', default=0)`
-   at module level. Wrap the tool dispatcher call in `set`/`reset`.
-   This is the **only hermes-agent core change required for v0.1**.
+**No hermes-agent core changes are required for v0.1 to function.**
+The plugin is self-contained:
 
-2. **`auxiliary_client.py` extension** (Hermes core): expose a
-   `panel_call()` helper that takes a list of model identifiers and
-   fans out via `asyncio.gather`. The hermes-native backend uses this
-   helper. (May not be a true core change — could be a new module
-   under `tools/fusion/`. The exact location is decided during
-   implementation.)
+1. **`tools/fusion/runner.py` defines the plugin's own `ContextVar[int]`
+   named `_fusion_depth`** (see §4.4). The runner manages set/reset
+   around each call. The plugin does not import from `run_agent.py`.
+
+2. **`auxiliary_client.py` extension** (still in this repo, not in
+   hermes-agent core): expose a `_panel_call()` helper that takes a
+   list of model identifiers and fans out via
+   `asyncio.gather(..., return_exceptions=True)`. The hermes-native
+   backend uses this helper. (May end up being a function in
+   `tools/fusion/backends/hermes_native.py` itself rather than an
+   extension to `auxiliary_client.py` — the exact location is decided
+   during implementation. The behavior is the same either way.)
 
 ### v0.1.1 (separate PR, after the plugin is battle-tested)
 
-3. **`model_tools.py:224`** — add `"fusion_tools": ["openrouter_fusion"]`
+The v0.1.1 PR is **atomic** — all 5 items ship together as a coherent
+unit. No ordering risk.
+
+3. **`model_tools.py:224`** — add `"fusion_tools": ["fusion"]`
 4. **`model_tools.py:_DEFAULT_OFF_TOOLSETS`** — add `"fusion_tools"`
 5. **`toolsets.py` / `AGENTS.md`** — add `fusion` to the documented
    toolset keys
+6. **Optional: `run_agent.py` patch** — if the upstream maintainers
+   agree, add a shared ContextVar registry so the plugin's
+   `_fusion_depth` is visible to the agent loop for tool-budget
+   accounting. **Not required for v0.1** — the plugin self-guards
+   today.
 
 ### Deferred to v0.2 (provider plugin)
 
-6. **`plugins/model-providers/fusion/`** — full `ProviderProfile` for
+7. **`plugins/model-providers/fusion/`** — full `ProviderProfile` for
    `openrouter/fusion` as a selectable primary model. Deferred because
    (a) unguarded cost-explosion path, (b) needs panel-aware model
    routing, (c) needs per-session cost caps.
 
 ---
 
-## 9. Open questions for review
+## 9. Open questions for review (status after Pass 1 and Pass 2)
 
-1. **Should the v0.1 tool name be `openrouter_fusion` or just `fusion`?**
-   v1 used `openrouter_fusion` to be honest about the dependency.
-   v0.1's default backend is hermes-native — the `openrouter_` prefix
-   is misleading. **Recommendation: rename to `fusion` in v0.1.** This
-   is the v2 plan. Both v1 history and v0.2 cleanliness argue for it.
-   *Punted to §9 T1 below — implementation will pick.*
-2. **Should the judge be hermes-native's curator slot, or always an
-   explicit model?** `auxiliary-curator` is the right default for
-   hermes-native (free, configurable, typically a strong reasoner).
-   But if the user hasn't configured the curator slot, fall back to
-   the outer model. *T2 below.*
-3. **How should hermes-native handle the `model.fallback_providers`
-   chain — apply it per panel member, or run the chain sequentially?**
-   Per-panel-member fallback (i.e., if Claude fails for panel member 1,
-   fall back to DeepSeek for that member) is the cleanest answer. It
-   means the panel is "3 model attempts" not "3 specific models or
-   nothing." *T3 below.*
-4. **Should the structured-analysis prompt be configurable?**
-   Yes — different use cases (legal review vs. code review vs. creative
-   brainstorming) want different analysis lenses. v0.1 ships a default
-   prompt + a config override. *T4 below.*
-5. **Web tools in panel members — both backends?** OpenRouter enables
-   them by default; hermes-native's panel members are regular model
-   calls that *could* have web tools enabled. v0.1 explicitly disabled
-   in both. v0.2 may expose as opt-in. *T5 below.*
+### Resolved in Pass 1 (carried into v2)
 
-### New questions for Pass 2 (buildability lens)
+1. ~~Should the v0.1 tool name be `openrouter_fusion` or just `fusion`?~~
+   **Resolved (Pass 2): `fusion`.** Renamed in v0.1 (T1.2). v0.1 hasn't
+   shipped, no v1 to be compatible with. Schema description and AC
+   updated throughout the plan.
+2. ~~Should the judge be hermes-native's curator slot, or always an
+   explicit model?~~ **Resolved (Pass 2 T2.5):** `outer-model` default;
+   `auxiliary-curator` falls back to `outer-model` if unavailable;
+   `outer-model` unavailable → skip the judge, return raw responses.
+   See §4.5 resolution order.
+3. ~~How should hermes-native handle the `model.fallback_providers`
+   chain — apply it per panel member, or run the chain sequentially?~~
+   **Resolved (Pass 2 T2.1):** v0.1 uses per-member-FAIL (a failed
+   member appears in `failed_models`, others continue). Per-member-
+   SUBSTITUTE is v0.2 (requires `resolved_model` tracking).
+4. ~~Should the structured-analysis prompt be configurable?~~
+   **Resolved (Pass 1): hard-coded default `JUDGE_PROMPT` in v0.1;
+   config override is v0.2.** The plan's §4.5 documents the
+   `StructuredAnalysis` Pydantic model so a config override is a
+   trivial v0.2 follow-up.
+5. ~~Web tools in panel members — both backends?~~ **Resolved (Pass 1):
+   disabled in v0.1 in both backends (`enable_web_tools: false` in
+   openrouter-fusion config; hermes-native doesn't have a tool-call
+   loop in v0.1).** v0.2 may expose as opt-in.
 
-6. **Is the backend-ABC contract the right granularity?** The current
-   contract is `run_panel(request) -> PanelResponse`. Should the ABC
-   also expose `resolve_judge_model(strategy) -> str` so each backend
-   can implement its own judge resolution? Or should the runner do all
-   judge resolution and the backend just do panel fan-out?
-7. **Should the hermes-native backend use the existing `auxiliary_client`
-   or a new client?** `auxiliary_client.py` is the canonical path for
-   "call a single model with the right plumbing." Reusing it is the
-   right call. But it doesn't expose `asyncio.gather` semantics — we
-   may need to extend it.
-8. **The `auxiliary.curator` slot — what if the user has it set to a
-   model that's not in their fallback chain?** E.g., curator is Kimi
-   K2.6 but the fallback chain is Anthropic-only. The judge call would
-   need a Kimi key. Resolve by: (a) require the user to have the
-   curator's provider keys set, (b) fall back to the outer model, or
-   (c) skip the structured-analysis step and return raw responses.
-9. **What about hermes-native's behavior when the user's
-   `model.fallback_providers` is empty?** The default panel would be
-   empty, the tool would refuse. Resolve by: (a) refuse with a clear
-   error message, (b) fall back to the primary model alone (panel of
-   1, the judge has nothing to compare).
-10. **Backwards compatibility with v1's `openrouter_fusion` tool name.**
-    If we rename to `fusion` in v0.1, the v1 name disappears. Anyone
-    who has been calling `openrouter_fusion` in scripts breaks. Resolve
-    by: (a) ship both names with the v1 name as a deprecation shim, (b)
-    ship only `fusion` and accept the break.
+### Resolved in Pass 2
+
+6. ~~Is the backend-ABC contract the right granularity?~~ **Resolved
+   (Pass 2 T3.1 follow-up): the current contract is fine for v0.1.
+   `resolve_judge_model` per backend is a v0.2 exploration.**
+7. ~~Should the hermes-native backend use the existing
+   `auxiliary_client` or a new client?~~ **Resolved (Pass 2 §8.2):** the
+   helper lives inside the plugin (`tools/fusion/`), not in
+   `auxiliary_client.py`. The plugin is self-contained.
+8. ~~Curator slot when its provider isn't in fallback_providers?~~
+   **Resolved (Pass 2 T2.5): fall back to `outer-model`, then skip
+   the judge. See §4.5.**
+9. ~~What about hermes-native's behavior when
+   `model.fallback_providers` is empty?~~ **Resolved (Pass 2 T1.7):
+   `check_requirements` returns False; tool is not callable; clear
+   error message to user.**
+10. ~~Backwards compat with v1's `openrouter_fusion` tool name.~~
+    **Resolved (Pass 2 T1.2): no compat shim needed. v0.1 ships as
+    `fusion`.** If a v1 prototype is out there, the rename is a
+    one-line search-and-replace.
+
+### Resolved (Pass 1, backfilled during Pass 2 cleanup)
+
+- `max_tool_calls` is **ignored by hermes-native in v0.1** (no
+  tool-call loop). Only openrouter-fusion uses it. See §4.2 note.
+- `analysis_models=[]` auto-population = first 3 of fallback chain.
+  See §5.
+- Backend registry is explicit (`register_backend()` in plugin
+  `__init__.py`), not Hermes's PluginManager. See §4.1.
+- `FusionConfig` built once at tool registration; per-call overrides
+  via kwargs to `run()`. See §4.2.
+- v0.1.1 PR is atomic (all 5 items in one PR). No ordering risk. See §8.
 
 ---
 
@@ -622,8 +767,8 @@ No live network calls in CI. Matches the Hermes skill standards.
 
 A PR that ships v0.1 is "done" when:
 
-- [ ] `openrouter_fusion` (or `fusion` — see §9 T1) tool registers and
-      is gated by `fusion_tools` toolset. Verified by
+- [ ] The tool is named **`fusion`** (not `openrouter_fusion`) and
+      registers in the `fusion_tools` toolset. Verified by
       `test_fusion_tool.py::test_registers_with_correct_toolset`
 - [ ] Schema is valid JSON Schema (verified by `jsonschema.validate`)
 - [ ] Tool default params resolve in the documented precedence order
@@ -635,71 +780,124 @@ A PR that ships v0.1 is "done" when:
       the env var)
 - [ ] `openrouter-fusion` is opt-in via the `backend` parameter or
       `fusion.backend` config; refuses if `OPENROUTER_API_KEY` unset
-- [ ] Recursion guard: `ContextVar` increments on entry, resets in
+- [ ] Recursion guard: plugin's own `ContextVar[int]` in
+      `tools/fusion/runner.py`, increments on entry, resets in
       `finally`, raises `RecursionError` when `>= 1`. Two consecutive
       calls in the same session both succeed.
 - [ ] Cost guard refuses `analysis_models` length > `max_panel_size`
       (default 8), schema `maxItems: 16`
-- [ ] Judge strategy resolution: `outer-model` (default), `auxiliary-curator`,
-      `explicit-model` (requires `judge_model` arg)
+- [ ] Judge strategy resolution: `outer-model` (default), `auxiliary-curator`
+      (falls back to `outer-model` if unavailable), `explicit-model`
+      (requires `judge_model` arg)
+- [ ] Runner owns the judge invocation (not the backend). The
+      `analysis` field is populated by the runner after `run_panel`
+      returns. The backend's `run_panel` leaves `analysis` and
+      `raw_judge_output` empty.
+- [ ] hermes-native uses `asyncio.gather(..., return_exceptions=True)`
+      so a single panel member's failure does NOT lose the others
+- [ ] hermes-native is per-member-FAIL (not per-member-substitute) in
+      v0.1: a failed member appears in `failed_models`, the panel
+      continues with the remaining members
+- [ ] hermes-native `check_requirements` returns False when
+      `model.fallback_providers` has <2 entries
 - [ ] `StructuredAnalysis` Pydantic model is shared between backends
 - [ ] All 11 unit tests pass; all 4 recorded-fixture tests pass
 - [ ] All 4 runner orchestration tests pass
 - [ ] All hermes-native backend tests pass with mocked `auxiliary_client`
-- [ ] Required fixtures exist and are sanitized
+- [ ] Required fixtures exist, are sanitized, and match the
+      `PanelResponse` shape documented in §7
 - [ ] `record_fusion.py` and `sanitize_fusion_fixture.py` exist
-- [ ] `run_agent.py` is modified to add the `ContextVar`
 - [ ] This plan's §11 CHANGELOG is updated to reflect any design
       changes made during implementation
-- [ ] Pass 2 cross-LLM review (buildability lens) finds no Tier 1 items
+- [ ] Pass 3 cross-LLM review (or focused re-review) confirms no
+      remaining Tier 1 items
 
 ### Out of v0.1 scope (deferred)
 
 - [ ] v0.1.1: upstream PR with `model_tools.py` / `toolsets.py` /
-      `AGENTS.md` additions
-- [ ] v0.2: provider plugin (`plugins/model-providers/fusion/`)
-- [ ] v0.2: `force` parameter and cost-guard override
-- [ ] v0.2: rename tool from `openrouter_fusion` to `fusion`
-      (or keep both as a compat shim)
+      `AGENTS.md` additions (atomic PR, all 5 items together)
+- [ ] v0.2: provider plugin (`plugins/model-providers/fusion/`) with
+      per-session cost caps and picker warnings
+- [ ] v0.2: `force` parameter and cost-guard override mechanism
+- [ ] v0.2: per-member-substitute fallback semantics
+- [ ] v0.2: tool-use loops in hermes-native panel members
 - [ ] v0.2: Anthropic batch API backend
 - [ ] v0.2: streaming tool results
 - [ ] v0.2: per-call dollar cap (`max_cost_usd`)
+- [ ] v0.2: configurable `JUDGE_PROMPT`
 
 ---
 
 ## 11. Changelog
 
-- **2026-06-13 (v2)** — Major pivot from v1. The tool is now
-  backend-pluggable; `hermes-native` (using existing model slots) is
-  the v0.1 default. OpenRouter's `openrouter:fusion` is an opt-in
-  alternate backend. The tool no longer requires OpenRouter. The
-  v1 plan is archived at
+- **2026-06-13 (v2 Pass 2 patches)** — Cross-LLM Pass 2 review
+  (4/4 providers: DeepSeek, GLM, Kimi, Mimo). Buildability lens.
+  8 Tier 1 + 9 Tier 2 items found, 5 Tier 3 follow-ups filed. All
+  Tier 1 + Tier 2 patched into the v2 plan. See
+  `docs/recaps/SESSION-RECAP-2026-06-13-CROSS-LLM-REVIEW-PASS2.md`.
+  Highlights:
+  - **T1.1:** Judge location contradiction (§4.2 vs §4.3 vs §6.1)
+    resolved. The **runner owns the judge**, not the backend. The
+    backend's `run_panel` returns empty `analysis` / empty
+    `raw_judge_output`; the runner fills them in.
+  - **T1.2:** Tool **renamed from `openrouter_fusion` to `fusion`**
+    in v0.1. v0.1 hasn't shipped, no v1 compat to preserve. The
+    "OpenRouter" name in the tool contradicted the v2 thesis.
+  - **T1.3:** `asyncio.gather(..., return_exceptions=True)` is now
+    **mandatory** in the hermes-native backend. Without it, a single
+    panel member's failure would crash the call and lose the
+    successful responses — directly contradicting the §4.6 partial-
+    failure-paths contract.
+  - **T1.4 + T1.5:** The recursion-guard `ContextVar` is now
+    **plugin-owned** in `tools/fusion/runner.py`. The plugin no
+    longer references `run_agent.py` (which doesn't exist in this
+    repo anyway — it's in hermes-agent core). v0.1.1 upstream PR
+    may add a shared ContextVar registry in hermes-agent for plugins
+    to publish their guards, but that's a v0.1.1 / v0.2 follow-up.
+  - **T1.6:** `max_tool_calls` is **ignored by hermes-native in v0.1**
+    (no tool-call loop in single completion calls). Only the
+    openrouter-fusion backend uses it.
+  - **T1.7:** hermes-native `check_requirements` now verifies
+    `model.fallback_providers` has ≥2 entries, returns False
+    otherwise. Tool is not callable until configured.
+  - **T1.8:** `analysis_models=[]` auto-population = first 3 of
+    fallback chain (or all of them if fewer than 3).
+  - **T2.1:** Per-member-FAIL semantics for hermes-native in v0.1
+    (per-member-substitute is v0.2).
+  - **T2.2:** `FusionConfig` built once at tool registration; per-call
+    overrides via kwargs.
+  - **T2.3:** Backend registry is explicit (`register_backend()` in
+    plugin `__init__.py`), not Hermes's PluginManager.
+  - **T2.4:** Recorded-fixture format documented in §7
+    (`PanelResponse`-shaped JSON).
+  - **T2.5:** `judge_strategy: auxiliary-curator` falls back to
+    `outer-model`, then to skip-the-judge.
+  - **T2.6:** `max_tool_calls` dead-weight fix (see T1.6).
+  - **T2.7:** `judge_strategy` default contradiction resolved
+    (`outer-model` is the default per §3; §4.5 example updated).
+  - **T2.8:** Judge input assembly format documented
+    ("You have been given the following {N} responses...").
+  - **T2.9:** v0.1.1 PR atomicity confirmed (all 5 items in one PR).
+
+- **2026-06-13 (v2 Pass 1 patches)** — Cross-LLM Pass 1 review
+  (3/4 providers: DeepSeek, GLM, Mimo; Kimi failed with temperature
+  bug). 11 Tier 1 + 8 Tier 2 items found. Most fixes carried over
+  from v1 (they were about correctness, not OpenRouter-specificity).
+  See `docs/recaps/SESSION-RECAP-2026-06-13-CROSS-LLM-REVIEW.md`.
+  Highlights: dropped `force` parameter, switched to `ContextVar`
+  guard, re-derived cost model, bumped schema `maxItems` to 16,
+  deferred provider plugin, added §4.0 wire-protocol verification
+  (since removed in v2 Pass 2), added file manifest, fixed JSON
+  Schema, added `judge_model_default` fallback, added
+  `enable_web_tools: false`, documented precedence, added
+  `timeout_seconds`, made AC specific, marked upstream PR as v0.1.1.
+
+- **2026-06-13 (v2 pivot)** — User clarified: "I don't want to use
+  openrouter, I want hermes agent to have this functionality." v1
+  made OpenRouter a hard dependency for the only shipped backend.
+  v2 makes the tool backend-pluggable: `hermes-native` (default, no
+  external dep) and `openrouter-fusion` (opt-in). See
+  `docs/recaps/SESSION-RECAP-2026-06-13-PIVOT-TO-HERMES-NATIVE.md`.
+
+- **2026-06-13 (v1 initial draft)** — See archive:
   `archive/2026-06-13-fusion-tool-design-v1-ORwrapper.md`.
-
-- **2026-06-13 (v1 Pass 1 patches)** — Cross-LLM review applied 11
-  Tier 1 + 8 Tier 2 fixes to the v1 plan. **Most of those fixes
-  carry over to v2** because they were about correctness, not
-  OpenRouter-specificity:
-  - `force` parameter dropped → carried over
-  - `ContextVar` recursion guard → carried over
-  - Cost guard with `max_panel_size` + `maxItems: 16` → carried over
-  - File manifest in §2 → carried over, expanded
-  - `judge_model_default` fallback → carried over
-  - `enable_web_tools: false` → carried over to openrouter-fusion
-    backend config
-  - Documented precedence → carried over
-  - `timeout_seconds` parameter → carried over
-  - Specific, falsifiable acceptance criteria → carried over
-  - §4.1 partial-failure-paths table → generalized in v2 §4.6
-  - Invalid JSON Schema fix → carried over
-  - `run_agent.py` integration → carried over
-  - Provider plugin deferred → carried over
-  - Upstream PR deferred to v0.1.1 → carried over
-  - **Removed from v2:** the §4.0 "wire protocol verification"
-    prerequisite. The hermes-native backend uses Hermes's existing
-    clients — no wire protocol to verify. The openrouter-fusion
-    backend *does* need wire-protocol verification, but that's a
-    single backend's concern, not the tool's. Moved to a backend
-    implementation note.
-
-- **2026-06-13 (v1 initial draft)** — See archive.

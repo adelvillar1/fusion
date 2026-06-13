@@ -79,7 +79,27 @@ develop ──► main
   as a dependency. Tool is now backend-pluggable; `hermes-native` is the
   v0.1 default using existing model slots. See
   `docs/recaps/SESSION-RECAP-2026-06-13-PIVOT-TO-HERMES-NATIVE.md`.
-- v2 plan at 32 KB. Most v1 Tier 1+2 fixes carried over (they were
-  about correctness, not OpenRouter-specificity).
-- Next concrete step: **Pass 2 cross-LLM review** of v2 with the
-  buildability lens (Pattern 4b), then implementation.
+- **Pass 2 cross-LLM review (buildability lens) complete on 2026-06-13.**
+  4/4 providers completed (DeepSeek, GLM, Kimi, Mimo). 8 Tier 1 + 9
+  Tier 2 items found, all patched. See
+  `docs/recaps/SESSION-RECAP-2026-06-13-CROSS-LLM-REVIEW-PASS2.md`.
+- **Major design changes from Pass 2:**
+  - Tool **renamed from `openrouter_fusion` to `fusion`** in v0.1 (T1.2)
+  - Judge ownership fixed: **runner owns the judge**, not the backend
+    (T1.1 — three-way contradiction in §4.2/§4.3/§6.1 resolved)
+  - `asyncio.gather(..., return_exceptions=True)` is now mandatory in
+    hermes-native (T1.3 — critical bug that would have lost responses
+    on partial failure)
+  - Recursion-guard ContextVar is now **plugin-owned** in
+    `tools/fusion/runner.py`, not in hermes-agent's `run_agent.py`
+    (T1.4 + T1.5 — this is a plugin repo, `run_agent.py` doesn't
+    exist here)
+  - hermes-native `check_requirements` verifies ≥2 fallback_providers
+    (T1.7)
+  - `analysis_models=[]` auto-population = first 3 of fallback chain
+    (T1.8)
+  - `max_tool_calls` ignored by hermes-native v0.1 (T1.6)
+  - Per-member-FAIL semantics (not per-member-substitute) in v0.1
+    (T2.1)
+- Next concrete step: implementation. The plan is now consistent
+  end-to-end and ready to hand to a subagent via `delegate_task`.
