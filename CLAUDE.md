@@ -66,7 +66,20 @@ develop ──► main
 
 ## Today's state
 
-- Repo scaffolded 2026-06-13. No runtime code; only design plan + stubs.
-- Plan to implement: TBD pending cross-LLM review of the design plan.
-- Next concrete step: cross-LLM review of
-  `docs/plans/2026-06-13-fusion-tool-design.md`, then implement v0.1.
+- Repo scaffolded 2026-06-13. No runtime code yet; only design plan + stubs.
+- **Pass 1 cross-LLM review complete (2026-06-13).** 3/4 providers
+  completed (DeepSeek, GLM, Mimo). Kimi failed with the documented
+  temperature bug. 11 Tier 1 items found, 8 Tier 2 items found, 5 Tier 3
+  follow-up plans filed. All Tier 1 + Tier 2 patches applied to the
+  design plan. See `docs/recaps/SESSION-RECAP-2026-06-13-CROSS-LLM-REVIEW.md`
+  for the full synthesis.
+- **Major design changes from Pass 1:**
+  - `force` parameter dropped (T1.1, T1.2)
+  - Recursion guard switched from env-var to `ContextVar` (T1.3)
+  - Cost estimate corrected from $0.30/call to $1.30–$2.00/call (T1.4)
+  - Schema `maxItems` bumped to 16 so the cost guard can fire (T1.5)
+  - Provider plugin deferred to v0.2 (T1.6)
+  - Partial-failure paths fully enumerated in §4.1 (T1.7)
+  - Wire-protocol live verification added as §4.0 prerequisite (T1.8)
+- Next concrete step: **Pass 2 cross-LLM review** with the buildability
+  lens (Pattern 4b), then implementation.
