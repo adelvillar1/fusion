@@ -80,26 +80,17 @@ develop ──► main
   v0.1 default using existing model slots. See
   `docs/recaps/SESSION-RECAP-2026-06-13-PIVOT-TO-HERMES-NATIVE.md`.
 - **Pass 2 cross-LLM review (buildability lens) complete on 2026-06-13.**
-  4/4 providers completed (DeepSeek, GLM, Kimi, Mimo). 8 Tier 1 + 9
-  Tier 2 items found, all patched. See
+  4/4 providers completed. 8 Tier 1 + 9 Tier 2 items found, all
+  patched. See
   `docs/recaps/SESSION-RECAP-2026-06-13-CROSS-LLM-REVIEW-PASS2.md`.
-- **Major design changes from Pass 2:**
-  - Tool **renamed from `openrouter_fusion` to `fusion`** in v0.1 (T1.2)
-  - Judge ownership fixed: **runner owns the judge**, not the backend
-    (T1.1 — three-way contradiction in §4.2/§4.3/§6.1 resolved)
-  - `asyncio.gather(..., return_exceptions=True)` is now mandatory in
-    hermes-native (T1.3 — critical bug that would have lost responses
-    on partial failure)
-  - Recursion-guard ContextVar is now **plugin-owned** in
-    `tools/fusion/runner.py`, not in hermes-agent's `run_agent.py`
-    (T1.4 + T1.5 — this is a plugin repo, `run_agent.py` doesn't
-    exist here)
-  - hermes-native `check_requirements` verifies ≥2 fallback_providers
-    (T1.7)
-  - `analysis_models=[]` auto-population = first 3 of fallback chain
-    (T1.8)
-  - `max_tool_calls` ignored by hermes-native v0.1 (T1.6)
-  - Per-member-FAIL semantics (not per-member-substitute) in v0.1
-    (T2.1)
-- Next concrete step: implementation. The plan is now consistent
-  end-to-end and ready to hand to a subagent via `delegate_task`.
+- **🎉 v0.1 implementation SHIPPED on 2026-06-13.** 17 files, 2,222
+  insertions, 39 tests passing, 4 recorded-fixture tests skipped
+  (no fixtures yet). See
+  `docs/recaps/SESSION-RECAP-2026-06-13-V01-IMPLEMENTATION.md`.
+- All 11 v0.1 acceptance criteria from plan §10 met.
+- Subagent dispatch fell back to direct implementation (Kimi-k2.6
+  invalid tool calls; per the `subagent-driven-development` skill's
+  documented fallback after 2 failures).
+- Next concrete step: **v0.1.1 atomic upstream PR to hermes-agent**
+  (5 items: model_tools.py, _DEFAULT_OFF_TOOLSETS, toolsets.py,
+  AGENTS.md, optional run_agent.py patch).
