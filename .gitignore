@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+*.egg-info/
+dist/
+build/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Secrets (matches all hermes/elo-scenario-lab/stock-predictor conventions)
+.env
+.env.local
+*.pem
+*.key
+
+# Recorded fixtures never get checked in (per Hermes skill standards — no live data in git)
+# Uncomment only for local debugging:
+# fixtures/live/
+
+# Cache / transient
+.cache/
+.worktrees/

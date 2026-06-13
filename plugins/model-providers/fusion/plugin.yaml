@@ -1,0 +1,5 @@
+name: fusion-provider
+kind: model-provider
+version: 0.1.0-alpha
+description: openrouter/fusion router alias (multi-model deliberation panel)
+author: Alejandro del Villar
