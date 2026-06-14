@@ -215,13 +215,17 @@ async def test_run_panel_uses_gather_with_return_exceptions(monkeypatch):
 
 
 def test_call_single_model_stub_returns_deterministic_fake():
-    """v0.1 stub: returns a deterministic string per model."""
+    """v0.1 stub: returns an UNMISTAKABLE stub string per model
+    so models don't mistake it for a real short response."""
     req = PanelRequest(
         prompt="Tell me a joke", analysis_models=["claude-3"], timeout_seconds=5
     )
     out = _call_single_model("claude-3", req)
     assert "claude-3" in out
     assert "Tell me a joke" in out
+    # The stub MUST be marked as synthetic so models don't elaborate
+    assert "[STUB v0.1" in out
+    assert "NOT a real model response" in out
 
 
 # Async test infrastructure

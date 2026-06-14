@@ -35,19 +35,23 @@ except ImportError:
     _REGISTRY_AVAILABLE = False
 
 
-FUSION_TOOLSET = "fusion_tools"
+FUSION_TOOLSET = "moa_tools"
 
 TOOL_NAME = "fusion"
 
 TOOL_SCHEMA: dict[str, Any] = {
     "name": TOOL_NAME,
     "description": (
-        "Run the user prompt through a panel of 2-16 models in parallel "
-        "and have a judge model produce structured analysis (consensus, "
-        "contradictions, unique insights, blind spots) plus the raw "
-        "panel responses. Use for 'where do experts disagree' or "
-        "high-stakes multi-perspective tasks. Default backend (hermes-native) "
-        "uses your existing model providers — no external dependency."
+        "Run the user prompt through a panel of 2-16 models in parallel and have a "
+        "judge model produce structured analysis (consensus, contradictions, unique "
+        "insights, blind spots) plus the raw panel responses. Use this when you want "
+        "to know WHERE EXPERTS DISAGREE, not just get a single best answer. "
+        "Sibling of mixture_of_agents under the same moa_tools toolset. "
+        "Default backend (hermes-native) uses your existing model providers — no external dependency. "
+        "Pass analysis_models as a LIST OF MODEL NAME STRINGS, e.g. "
+        "analysis_models=['MiniMax-M3', 'glm-5.1:cloud', 'mimo-v2-omni']. "
+        "NOT a list of dicts. Each string is a model identifier; the tool fans out "
+        "the same prompt to all of them in parallel."
     ),
     "parameters": {
         "type": "object",
@@ -59,10 +63,14 @@ TOOL_SCHEMA: dict[str, Any] = {
                 "minItems": 2,
                 "maxItems": 16,
                 "description": (
-                    "Panel models. Defaults to fusion.analysis_models from "
-                    "config.yaml (or first 3 of model.fallback_providers if "
-                    "empty). Hard cap is schema maxItems (16); runtime cost "
-                    "guard is fusion.max_panel_size (default 8)."
+                    "List of model name strings (NOT dicts). Each is a model "
+                    "identifier; the tool fans out the same prompt to all of "
+                    "them in parallel. Example: "
+                    "['MiniMax-M3', 'glm-5.1:cloud', 'mimo-v2-omni']. "
+                    "Defaults to fusion.analysis_models from config.yaml "
+                    "(or first 3 of model.fallback_providers if empty). "
+                    "Hard cap is schema maxItems (16); runtime cost guard "
+                    "is fusion.max_panel_size (default 8)."
                 ),
             },
             "backend": {

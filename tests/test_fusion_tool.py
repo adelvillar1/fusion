@@ -23,8 +23,11 @@ def test_tool_name_is_fusion():
 
 
 def test_toolset_is_fusion_tools():
+    """v0.1 ships fusion under moa_tools (per Path A of root-cause
+    analysis: reuses MiniMax/Kimi/GLM/MiMo's existing training
+    distribution for the moa_tools toolset)."""
     from tools.fusion_tool import FUSION_TOOLSET
-    assert FUSION_TOOLSET == "fusion_tools"
+    assert FUSION_TOOLSET == "moa_tools"
 
 
 def test_schema_has_required_prompt():
@@ -108,7 +111,7 @@ def test_registry_register_called_with_correct_args(monkeypatch):
     kwargs = call.kwargs
 
     assert kwargs["name"] == "fusion"
-    assert kwargs["toolset"] == "fusion_tools"
+    assert kwargs["toolset"] == "moa_tools"  # sibling of mixture_of_agents
     assert kwargs["is_async"] is True
     assert kwargs["emoji"]  # non-empty
     assert "openrouter:fusion" not in kwargs["description"].lower() or True  # sanity

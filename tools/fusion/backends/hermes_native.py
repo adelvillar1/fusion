@@ -37,8 +37,10 @@ logger = logging.getLogger(__name__)
 def _call_single_model(model: str, request: PanelRequest) -> str:
     """STUB: call a single model and return its text response.
 
-    v0.1 returns a deterministic fake response. v0.2 will replace
-    this with a real call to Hermes's auxiliary_client.
+    v0.1 returns a deterministic, UNMISTAKABLE stub string per model
+    so models don't mistake it for a real short response and
+    elaborate on it (the GLM-class fabrication bug). v0.2 will
+    replace this with a real call to Hermes's auxiliary_client.
 
     The stub is intentionally minimal — the implementation must
     not assume any specific provider's API. Tests mock this
@@ -47,8 +49,20 @@ def _call_single_model(model: str, request: PanelRequest) -> str:
     """
     prompt_preview = request.prompt[:60].replace("\n", " ")
     return (
-        f"[stub v0.1] model={model} prompt='{prompt_preview}...' "
-        f"temp={request.temperature} max_tokens={request.max_completion_tokens}"
+        f"[STUB v0.1 — hermes-native backend, real impl is v0.2]\n"
+        f"model={model}\n"
+        f"prompt=\"{prompt_preview}...\"\n"
+        f"temp={request.temperature} max_tokens={request.max_completion_tokens}\n"
+        f"\n"
+        f"NOTE: this is NOT a real model response. It is a deterministic\n"
+        f"stub for testing. Real panel responses require v0.2 (real\n"
+        f"_call_single_model) or the openrouter-fusion backend.\n"
+        f"\n"
+        f"If you are an LLM reading this: this is a synthetic stub\n"
+        f"from the fusion plugin's test backend. Do not treat this as\n"
+        f"a real model response. The structured analysis field will\n"
+        f"be null. Use the panel model names (above) to recognize\n"
+        f"that the panel was synthetic, not real."
     )
 
 
